@@ -3,7 +3,10 @@ package AWS::S3::File;
 
 use VSO;
 use Carp 'confess';
-
+use JSON::XS;
+use MIME::Base64;
+use Crypt::OpenSSL::Random;
+use Crypt::OpenSSL::RSA;
 
 has 'key' => (
   is        => 'ro',
@@ -179,7 +182,111 @@ sub delete
   return 1;
 }# end delete()
 
+sub cloudfront_url
+{
+  my ($s, %args) = @_;
+
+  foreach my $arg (qw(private_key keypair_id distribution expires))
+  {
+    die "Required argument: $arg not provided" unless $args{$arg};
+  }
+
+  my $distribution = $args{distribution};
+  my $domain = $distribution->DomainName;
+  my $path = $s->key;
+  my $resource = "http://$domain/$path";
+  my $expires = $args{expires} + time();
+  my $private_key = $args{private_key};
+  my $keypair_id = $args{keypair_id};
+
+  my $policy = JSON::XS->new->utf8->encode({
+    Statement => [
+      Resource  => $resource,
+      Condition => {
+        DateLessThan  => {
+          'AWS:EpochTime' => $expires
+        }
+      }
+    ]
+  });
+  my $encoded_policy    = _url_safe_base64_encode( $policy );
+  my $signature         = _rsa_sha1_sign($policy, $private_key);
+  die "Could not generate signature" unless $signature;
+
+  my $encoded_signature = _url_safe_base64_encode($signature);
+  my $generated_url     = _create_url($resource, $encoded_policy, $encoded_signature, $keypair_id, $expires);
+
+  return $generated_url;
+}
+
+sub _create_url {
+  my ($path, $policy, $signature, $key_pair_id, $expires) = @_;
+
+  my $result;
+  my $separator = $path =~ m/\?/ ? '&' : '?';
+  $result = "$path$separator" . "Policy=$policy&Signature=$signature&Key-Pair-Id=$key_pair_id";
+  $result =~ s/\n//g;
+
+  return $result;
+}# end _create_url()
+
+
+# Encode a string with base 64 encoding and replace some invalid URL characters
+sub _url_safe_base64_encode
+{
+  my ($value) = @_;
+
+  my $result = encode_base64($value);
+  $result =~ tr|+=/|-_~|;
+
+  return $result;
+}# end _url_safe_base64_encode()
+
+
+# Sign a document with given private key file.
+# The first argument is the document to sign
+# The second argument is the name of the private key file
+sub _rsa_sha1_sign_OLD
+{
+  use File::Temp 'tempfile';
+  use IPC::Open2;
+
+  my ($to_sign, $pvkFile) = @_;
+
+  return _write_to_program("openssl sha1 -sign $pvkFile", $to_sign);
+}# end _rsa_sha1_sign()
+
+sub _rsa_sha1_sign
+{
+  my ($to_sign, $private_key_text) = @_;
+  my $rsa_private = Crypt::OpenSSL::RSA->new_private_key($private_key_text);
+  $rsa_private->use_pkcs1_padding();
+  return $rsa_private->sign($to_sign);
+}
+
+# Helper function to write data to a program
+sub _write_to_program
+{
+  my ($prog, $data) = @_;
+
+  my ($ifh, $ofh);
+  my $pid = open2($ifh, $ofh, $prog);
+  print $ofh $data;
+  close $ofh;
+
+  # slurp entire contents of output into scalar
+  local $/;
+  my $output = scalar(<$ifh>);
+  close $ifh;
+
+  waitpid($pid, 0);
+
+  return $output;
+}# end _write_to_program()
+
 1;# return true:
+
+
 
 =pod
 
